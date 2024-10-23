@@ -16,24 +16,24 @@
 \******************************************************************************/
 
 #define USE_MIDI
-
+#define USE_TINYUSB
 // ESP32 default pin definition ("-1" means that this channel is unused):
 // For older prototypes or custom implementations, simply change the GPIO numbers in the table below
 // to match your hardware (note that the GPIO assignment of Prototype 2 is the same as Prototype 4).
 // clang-format off
 // analog pins setup:               snare | kick | hi-hat | hi-hat-ctrl | crash | tom1 | ride | tom2 | tom3
-static int analog_pins4[]         = { 36,    33,     32,       25,         34,     39,    27,    12,    15 };
-static int analog_pins_rimshot4[] = { 35,    -1,     26,       -1,         14,     -1,    13,    -1,    -1 };
+static int analog_pins4[]         = {  1,      6,      5,        7,          3,      2,     9,    11,    13 };
+static int analog_pins_rimshot4[] = {  4,     -1,      8,       -1,         10,     -1,    12,    -1,    -1 };
 // clang-format on
 
 // if you want to use less number of pads, simply adjust number_pads4 value
 // const int number_pads4 = sizeof ( analog_pins4 ) / sizeof ( int ); // example: use all inputs defined in analog_pins4
-const int number_pads4 = 8; // example: do not use tom3 and shrink number of pads from 9 to 8
-// const int number_pads4 = 1; // example: just one single pad
+//const int number_pads4 = 8; // example: do not use tom3 and shrink number of pads from 9 to 8
+const int number_pads4 = 1; // example: just one single pad
 
 #include "edrumulus.h"
 
-#ifdef USE_MIDI
+#ifdef USE_MIDI 
 #  ifdef ESP_PLATFORM
 #    include <MIDI.h>
 #    ifdef USE_TINYUSB
@@ -138,8 +138,12 @@ void preset_settings()
 
 void loop()
 {
+  static uint32_t LoopCounter = 0, MidiSends = 0;
+  static unsigned long StatsTime = 0;
+
   // this function is blocking at the system sampling rate
   edrumulus.process();
+  LoopCounter ++;
 
   // status LED handling
   if (edrumulus.get_status_is_overload() || edrumulus.get_status_is_error())
@@ -162,6 +166,7 @@ void loop()
           // 1 means to set error state
           MYMIDI.sendNoteOff(125, 1, 1);
         }
+        MidiSends ++;
       }
 #endif
     }
@@ -174,6 +179,7 @@ void loop()
       is_status_LED_on = false;
 #ifdef USE_MIDI
       MYMIDI.sendNoteOff(125, 0, 1); // 0 means that all errors are cleared
+      MidiSends ++;
 #endif
     }
   }
@@ -193,6 +199,7 @@ void loop()
       {
         const int midi_pos = edrumulus.get_midi_pos(pad_idx);
         MYMIDI.sendControlChange(16, midi_pos, midi_channel); // positional sensing
+        MidiSends ++;
       }
 
       // send Hi-Hat control message right before each Hi-Hat pad hit
@@ -202,6 +209,7 @@ void loop()
         const int  midi_ctrl_value = edrumulus.get_midi_ctrl_value(hihatctrl_pad_idx);
         const bool hi_hat_is_open  = edrumulus.get_midi_ctrl_is_open(hihatctrl_pad_idx);
         MYMIDI.sendControlChange(midi_ctrl_ch, midi_ctrl_value, midi_channel);
+        MidiSends ++;
 
         // if Hi-Hat is open, overwrite MIDI note
         if (hi_hat_is_open)
@@ -212,6 +220,7 @@ void loop()
 
       MYMIDI.sendNoteOn(midi_note, midi_velocity, midi_channel); // (note, velocity, channel)
       MYMIDI.sendNoteOff(midi_note, 0, midi_channel);            // we need a note off
+      MidiSends += 2;
     }
 
     if (edrumulus.get_control_found(pad_idx))
@@ -219,6 +228,7 @@ void loop()
       const int midi_ctrl_ch    = edrumulus.get_midi_ctrl_ch(pad_idx);
       const int midi_ctrl_value = edrumulus.get_midi_ctrl_value(pad_idx);
       MYMIDI.sendControlChange(midi_ctrl_ch, midi_ctrl_value, midi_channel);
+      MidiSends ++;
     }
 
     if (edrumulus.get_choke_on_found(pad_idx))
@@ -231,6 +241,7 @@ void loop()
         const int midi_choke_noteon = edrumulus.get_midi_note_open_norm(pad_idx);
         MYMIDI.sendNoteOn(midi_choke_noteon, 127, midi_channel);
         MYMIDI.sendNoteOff(midi_choke_noteon, 0, midi_channel); // we need a note off
+        MidiSends += 2;
       }
       else
       {
@@ -239,6 +250,7 @@ void loop()
         MYMIDI.MIDI_SEND_AFTER_TOUCH(edrumulus.get_midi_note_rim(pad_idx), 127, midi_channel);
         MYMIDI.MIDI_SEND_AFTER_TOUCH(edrumulus.get_midi_note_open_norm(pad_idx), 127, midi_channel);
         MYMIDI.MIDI_SEND_AFTER_TOUCH(edrumulus.get_midi_note_open_rim(pad_idx), 127, midi_channel);
+        MidiSends += 4;
       }
     }
     else if (edrumulus.get_choke_off_found(pad_idx))
@@ -248,6 +260,7 @@ void loop()
       MYMIDI.MIDI_SEND_AFTER_TOUCH(edrumulus.get_midi_note_rim(pad_idx), 0, midi_channel);
       MYMIDI.MIDI_SEND_AFTER_TOUCH(edrumulus.get_midi_note_open_norm(pad_idx), 0, midi_channel);
       MYMIDI.MIDI_SEND_AFTER_TOUCH(edrumulus.get_midi_note_open_rim(pad_idx), 0, midi_channel);
+      MidiSends += 4;
     }
   }
 
@@ -457,6 +470,13 @@ void loop()
     }
   }
 #endif
+  if((millis() - StatsTime) >= 1000)
+  {
+    StatsTime = millis();
+
+    Serial.printf("Stats: Loops %d, Midi %d\r\n", LoopCounter, MidiSends);
+    LoopCounter = 0, MidiSends = 0;
+  }
 }
 
 #ifdef USE_MIDI
