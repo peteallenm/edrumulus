@@ -31,6 +31,8 @@ static int analog_pins_rimshot4[] = {  4,     -1,      8,       -1,         10, 
 //const int number_pads4 = 8; // example: do not use tom3 and shrink number of pads from 9 to 8
 const int number_pads4 = 1; // example: just one single pad
 
+#define MIDI_QUEUE_LEN 5
+
 #include "edrumulus.h"
 
 #ifdef USE_MIDI 
@@ -38,8 +40,8 @@ const int number_pads4 = 1; // example: just one single pad
 #    include <MIDI.h>
 #    ifdef USE_TINYUSB
 #      include <Adafruit_TinyUSB.h>
-Adafruit_USBD_MIDI usb_midi;
-MIDI_CREATE_INSTANCE(Adafruit_USBD_MIDI, usb_midi, MIDI);
+      Adafruit_USBD_MIDI usb_midi;
+      MIDI_CREATE_INSTANCE(Adafruit_USBD_MIDI, usb_midi, MIDI);
 #    else
 MIDI_CREATE_DEFAULT_INSTANCE();
 #    endif
@@ -65,8 +67,51 @@ int       status_LED_pin    = 0;            // initialization value, will be set
 bool      is_status_LED_on  = false;        // initialization value
 int       selected_pad      = 0;            // initialization value
 
+#ifdef USE_MIDI 
+typedef enum
+{
+  MIDI_UNKNOWN,
+  MIDI_NOTEON,
+  MIDI_NOTEOFF,
+  MIDI_CONTROL,
+  MIDI_AFTERTOUCH,
+  NUM_MIDI_TYPES
+} MIDI_MSG_TYPE;
+
+typedef struct 
+{
+  MIDI_MSG_TYPE Type;
+  char Note;
+  char Vel;
+  char Chan;
+} MidiMessage;
+
+xQueueHandle MidiTxQueue = NULL;
+
+#endif
+
+static uint32_t LoopCounter = 0, MidiSends = 0;
+
+void EDrumulusTask(void *pArg);
+void MidiTask(void *pArg);
+bool SendMidiMsg(MIDI_MSG_TYPE Type, char Note, char Vel, char Chan);
+
+
 void setup()
 {
+  for (int i = 0; i < 5; i++)
+  {
+    neopixelWrite(RGB_BUILTIN, 255, 255, 255);
+    delay(100);
+    neopixelWrite(RGB_BUILTIN, 0, 0, 0);
+    delay(100);
+  }
+  
+  if (!TinyUSBDevice.isInitialized()) {
+    TinyUSBDevice.begin(0);
+  }
+  Serial.begin(115200);
+  Serial.printf("\n\n\n\n\rStart\r\n\n\n\n\n");
   // get the pin-to-pad assignments
   int*      analog_pins         = analog_pins4;         // initialize with the default setup
   int*      analog_pins_rimshot = analog_pins_rimshot4; // initialize with the default setup
@@ -74,21 +119,23 @@ void setup()
                                                                &analog_pins_rimshot,
                                                                &number_pads,
                                                                &status_LED_pin);
+  analog_pins         = analog_pins4;         // override get_prototype_pins
+  analog_pins_rimshot = analog_pins_rimshot4; 
 
   // initialize GPIO port for status LED and set it to on during setup
   pinMode(status_LED_pin, OUTPUT);
   digitalWrite(status_LED_pin, HIGH);
 
-#if defined(USE_SERIAL_DEBUG_PLOTTING) && defined(ESP_PLATFORM)
-  number_pads = min(number_pads, 7); // only max. 7 pads are supported for ESP32 serial debug plotting
+  edrumulus.setup(number_pads, analog_pins, analog_pins_rimshot);
+  digitalWrite(status_LED_pin, LOW); // set board LED to low right after setup is done
+
+#ifdef ESP_PLATFORM
+  preset_settings(); // for ESP32, the load/save of settings is not supported, preset instead
+#else
+  read_settings();
 #endif
-#ifdef USE_MIDI
-#  ifdef USE_TINYUSB
-  TinyUSBDevice.setProductDescriptor("Edrumulus");
-#  endif
-  MYMIDI.begin();
-#endif
-#ifdef MIDI_SERIAL
+
+#if 0 //MIDI_SERIAL
   if (prototype == 5)
   {
     Serial.begin(115200); // faster communication on prototype 5
@@ -98,17 +145,418 @@ void setup()
     Serial.begin(MIDI_SERIAL);
   }
 #else
-  Serial.begin(115200);
+  //Serial.begin(115200);
 #endif
 
-  edrumulus.setup(number_pads, analog_pins, analog_pins_rimshot);
-  digitalWrite(status_LED_pin, LOW); // set board LED to low right after setup is done
-#ifdef ESP_PLATFORM
-  preset_settings(); // for ESP32, the load/save of settings is not supported, preset instead
-#else
-  read_settings();
+
+#if defined(USE_SERIAL_DEBUG_PLOTTING) && defined(ESP_PLATFORM)
+  number_pads = min(number_pads, 7); // only max. 7 pads are supported for ESP32 serial debug plotting
 #endif
+
+
+#ifdef USE_MIDI
+
+  MidiTxQueue = xQueueCreate(MIDI_QUEUE_LEN, sizeof(MidiMessage));
+  if((!MidiTxQueue))
+  {
+    Serial.println("FATAL MIDI ISSUE!! Could not create MidiQueue");
+    return;
+  }
+  
+  xTaskCreate(MidiTask, "MidiTask", 2048, NULL, 5, NULL);
+#endif
+  xTaskCreate(EDrumulusTask, "EDrumulusTask", 4096, NULL, 4, NULL);
+
 }
+
+
+void EDrumulusTask(void *pArg)
+{
+  uint32_t TickDelay = pdMS_TO_TICKS(1);
+  while(1)
+  { 
+    // this function is blocking at the system sampling rate
+    edrumulus.process();
+    LoopCounter ++;
+    
+    // status LED handling
+    if (edrumulus.get_status_is_overload() || edrumulus.get_status_is_error())
+    {
+      
+      if (!is_status_LED_on)
+      {
+        digitalWrite(status_LED_pin, HIGH);
+        is_status_LED_on = true;
+  #ifdef USE_MIDI
+        if (edrumulus.get_status_is_error())
+        {
+          const int dc_offset_error_channel = edrumulus.get_status_dc_offset_error_channel();
+          if (dc_offset_error_channel >= 0)
+          {
+            // > 63 means DC offset error and pad/input index is coded in one value
+            SendMidiMsg(MIDI_NOTEOFF, 125, 64 + dc_offset_error_channel, 1);
+          }
+          else
+          {
+            // 1 means to set error state
+            SendMidiMsg(MIDI_NOTEOFF, 125, 1, 1);
+          }
+        }
+  #endif
+      }
+    }
+    else
+    {
+      if (is_status_LED_on)
+      {
+        digitalWrite(status_LED_pin, LOW);
+        is_status_LED_on = false;
+  #ifdef USE_MIDI
+        SendMidiMsg(MIDI_NOTEOFF, 125, 0, 1); // 0 means that all errors are cleared
+  #endif
+      }
+    }
+
+
+#ifdef USE_MIDI
+    // send MIDI note to drum synthesizer
+    for (int pad_idx = 0; pad_idx < number_pads; pad_idx++)
+    {
+      if (edrumulus.get_peak_found(pad_idx))
+      {
+        // get current MIDI note and velocity (maybe note will be overwritten later on)
+        const int midi_velocity = edrumulus.get_midi_velocity(pad_idx);
+        int       midi_note     = edrumulus.get_midi_note(pad_idx);
+
+        // send midi positional control message if positional sensing is enabled for the current pad
+        if (edrumulus.get_pos_sense_is_used(pad_idx))
+        {
+          const int midi_pos = edrumulus.get_midi_pos(pad_idx);
+          SendMidiMsg(MIDI_CONTROL, 16, midi_pos, midi_channel); // positional sensing
+        }
+
+        // send Hi-Hat control message right before each Hi-Hat pad hit
+        if (pad_idx == hihat_pad_idx)
+        {
+          const int  midi_ctrl_ch    = edrumulus.get_midi_ctrl_ch(hihatctrl_pad_idx);
+          const int  midi_ctrl_value = edrumulus.get_midi_ctrl_value(hihatctrl_pad_idx);
+          const bool hi_hat_is_open  = edrumulus.get_midi_ctrl_is_open(hihatctrl_pad_idx);
+          SendMidiMsg(MIDI_CONTROL, midi_ctrl_ch, midi_ctrl_value, midi_channel);
+
+          // if Hi-Hat is open, overwrite MIDI note
+          if (hi_hat_is_open)
+          {
+            midi_note = edrumulus.get_midi_note_open(pad_idx);
+          }
+        }
+        //Serial.printf("%x, %x, %x, %x\r\n", (int)MIDI_NOTEON, midi_note, midi_velocity, midi_channel);
+        SendMidiMsg(MIDI_NOTEON, midi_note, midi_velocity, midi_channel); // (note, velocity, channel)
+        SendMidiMsg(MIDI_NOTEOFF, midi_note, 0, midi_channel);            // we need a note off
+      }
+
+      if (edrumulus.get_control_found(pad_idx))
+      {
+        const int midi_ctrl_ch    = edrumulus.get_midi_ctrl_ch(pad_idx);
+        const int midi_ctrl_value = edrumulus.get_midi_ctrl_value(pad_idx);
+        SendMidiMsg(MIDI_CONTROL, midi_ctrl_ch, midi_ctrl_value, midi_channel);
+      }
+
+      if (edrumulus.get_choke_on_found(pad_idx))
+      {
+        // special case: if MIDI note open rim is set to zero, we use NoteOn instead of aftertouch
+        // for cymbal choke (#85), where the MIDI note for NoteOn is defined by MIDI note open norm
+        if (edrumulus.get_midi_note_open_rim(pad_idx) == 0)
+        {
+          // special case: if grabbed edge found, we send a MIDI NoteOn
+          const int midi_choke_noteon = edrumulus.get_midi_note_open_norm(pad_idx);
+          SendMidiMsg(MIDI_NOTEON, midi_choke_noteon, 127, midi_channel);
+          SendMidiMsg(MIDI_NOTEOFF, midi_choke_noteon, 0, midi_channel); // we need a note off
+        }
+        else
+        {
+          // if grabbed edge found, polyphonic aftertouch at 127 is transmitted for all notes of the pad
+          SendMidiMsg(MIDI_AFTERTOUCH, edrumulus.get_midi_note_norm(pad_idx), 127, midi_channel);
+          SendMidiMsg(MIDI_AFTERTOUCH, edrumulus.get_midi_note_rim(pad_idx), 127, midi_channel);
+          SendMidiMsg(MIDI_AFTERTOUCH, edrumulus.get_midi_note_open_norm(pad_idx), 127, midi_channel);
+          SendMidiMsg(MIDI_AFTERTOUCH, edrumulus.get_midi_note_open_rim(pad_idx), 127, midi_channel);
+        }
+      }
+      else if (edrumulus.get_choke_off_found(pad_idx))
+      {
+        // if released edge found, polyphonic aftertouch at 0 is transmitted for all notes of the pad
+        SendMidiMsg(MIDI_AFTERTOUCH, edrumulus.get_midi_note_norm(pad_idx), 0, midi_channel);
+        SendMidiMsg(MIDI_AFTERTOUCH, edrumulus.get_midi_note_rim(pad_idx), 0, midi_channel);
+        SendMidiMsg(MIDI_AFTERTOUCH, edrumulus.get_midi_note_open_norm(pad_idx), 0, midi_channel);
+        SendMidiMsg(MIDI_AFTERTOUCH, edrumulus.get_midi_note_open_rim(pad_idx), 0, midi_channel);
+      }
+    }
+#endif /* USE_MIDI */
+  }
+}
+
+bool SendMidiMsg(MIDI_MSG_TYPE Type, char Note, char Vel, char Chan)
+{
+  if(MidiTxQueue != NULL)
+  {
+    MidiMessage Msg = {.Type = Type, .Note = Note, .Vel = Vel, .Chan = Chan}; 
+    
+    if (xQueueSend(MidiTxQueue, &Msg, portMAX_DELAY) != pdPASS)
+    {
+      Serial.println("SendMidiMsg() Out of Midi TX Queue space");
+      return false;
+    }
+    MidiSends ++;
+    return true;
+  }
+}
+
+#ifdef USE_MIDI
+void MidiTask(void *pArg)
+{
+  uint32_t TickDelay = pdMS_TO_TICKS(1);
+  uint32_t TxDelay = pdMS_TO_TICKS(2);
+
+#  ifdef USE_TINYUSB
+  TinyUSBDevice.setProductDescriptor("Edrumulus");
+#  endif
+  MYMIDI.begin();
+
+  while(1)
+  {
+    MidiMessage Msg;
+    if (xQueueReceive(MidiTxQueue, &Msg, TxDelay) == pdTRUE)
+    {
+      //Serial.println("Midi send");
+      switch(Msg.Type)
+      {
+        case(MIDI_NOTEOFF):
+          MYMIDI.sendNoteOff(Msg.Note, Msg.Vel, Msg.Chan);
+          break;
+        case(MIDI_NOTEON):
+          MYMIDI.sendNoteOn(Msg.Note, Msg.Vel, Msg.Chan);
+          break;
+        case(MIDI_CONTROL):
+          MYMIDI.sendControlChange(Msg.Note, Msg.Vel, Msg.Chan);
+          break;
+        case(MIDI_AFTERTOUCH):
+          MYMIDI.MIDI_SEND_AFTER_TOUCH(Msg.Note, Msg.Vel, Msg.Chan);
+          break;
+        default:
+          Serial.printf("Invalid midi message %d,%d:%d:%d\r\n", Msg.Type, Msg.Note, Msg.Vel, Msg.Chan);
+          break;
+      }
+    }
+    else
+    {
+      if (MYMIDI.read(midi_channel))
+      {
+        if (MYMIDI.getType() == MIDI_CONTROL_CHANGE_TYPE)
+        {
+          const int controller = MYMIDI.getData1();
+          const int value      = MYMIDI.getData2();
+
+          // controller 102: pad type
+          if (controller == 102)
+          {
+            edrumulus.set_pad_type(selected_pad, static_cast<Pad::Epadtype>(value));
+            edrumulus.write_setting(selected_pad, 0, value);
+
+            // on a pad type change, return all parameters of the selected pad
+            confirm_setting(controller, value, true);
+          }
+
+          // controller 103: threshold
+          if (controller == 103)
+          {
+            edrumulus.set_velocity_threshold(selected_pad, value);
+            edrumulus.write_setting(selected_pad, 1, value);
+            confirm_setting(controller, value, false);
+          }
+
+          // controller 104: sensitivity
+          if (controller == 104)
+          {
+            edrumulus.set_velocity_sensitivity(selected_pad, value);
+            edrumulus.write_setting(selected_pad, 2, value);
+            confirm_setting(controller, value, false);
+          }
+
+          // controller 105: positional sensing threshold
+          if (controller == 105)
+          {
+            edrumulus.set_pos_threshold(selected_pad, value);
+            edrumulus.write_setting(selected_pad, 3, value);
+            confirm_setting(controller, value, false);
+          }
+
+          // controller 106: positional sensing sensitivity
+          if (controller == 106)
+          {
+            edrumulus.set_pos_sensitivity(selected_pad, value);
+            edrumulus.write_setting(selected_pad, 4, value);
+            confirm_setting(controller, value, false);
+          }
+
+          // controller 107: rim shot threshold
+          if (controller == 107)
+          {
+            edrumulus.set_rim_shot_threshold(selected_pad, value);
+            edrumulus.write_setting(selected_pad, 5, value);
+            confirm_setting(controller, value, false);
+          }
+
+          // controller 108: select pad
+          if ((controller == 108) && (value < MAX_NUM_PADS))
+          {
+            selected_pad = value;
+
+            // on a pad selection, return all parameters of the selected pad
+            confirm_setting(controller, value, true);
+          }
+
+          // controller 109: MIDI curve type
+          if (controller == 109)
+          {
+            edrumulus.set_curve(selected_pad, static_cast<Pad::Ecurvetype>(value));
+            edrumulus.write_setting(selected_pad, 6, value);
+            confirm_setting(controller, value, false);
+          }
+
+          // controller 110: spike cancellation level
+          if (controller == 110)
+          {
+            edrumulus.set_spike_cancel_level(value);
+            edrumulus.write_setting(number_pads, 0, value);
+            confirm_setting(controller, value, false);
+          }
+
+          // controller 111: enable/disable rim shot and positional sensing support
+          if (controller == 111)
+          {
+            switch (value)
+            {
+              case 0:
+                edrumulus.set_rim_shot_is_used(selected_pad, false);
+                edrumulus.write_setting(selected_pad, 7, false);
+                edrumulus.set_pos_sense_is_used(selected_pad, false);
+                edrumulus.write_setting(selected_pad, 8, false);
+                break;
+              case 1:
+                edrumulus.set_rim_shot_is_used(selected_pad, true);
+                edrumulus.write_setting(selected_pad, 7, true);
+                edrumulus.set_pos_sense_is_used(selected_pad, false);
+                edrumulus.write_setting(selected_pad, 8, false);
+                break;
+              case 2:
+                edrumulus.set_rim_shot_is_used(selected_pad, false);
+                edrumulus.write_setting(selected_pad, 7, false);
+                edrumulus.set_pos_sense_is_used(selected_pad, true);
+                edrumulus.write_setting(selected_pad, 8, true);
+                break;
+              case 3:
+                edrumulus.set_rim_shot_is_used(selected_pad, true);
+                edrumulus.write_setting(selected_pad, 7, true);
+                edrumulus.set_pos_sense_is_used(selected_pad, true);
+                edrumulus.write_setting(selected_pad, 8, true);
+                break;
+            }
+            confirm_setting(controller, value, false);
+          }
+
+          // controller 112: normal MIDI note
+          if (controller == 112)
+          {
+            edrumulus.set_midi_note_norm(selected_pad, value);
+            edrumulus.write_setting(selected_pad, 9, value);
+            confirm_setting(controller, value, false);
+          }
+
+          // controller 113: MIDI note for rim
+          if (controller == 113)
+          {
+            edrumulus.set_midi_note_rim(selected_pad, value);
+            edrumulus.write_setting(selected_pad, 10, value);
+            confirm_setting(controller, value, false);
+          }
+
+          // controller 114: cross talk cancellation
+          if (controller == 114)
+          {
+            edrumulus.set_cancellation(selected_pad, value);
+            edrumulus.write_setting(selected_pad, 11, value);
+            confirm_setting(controller, value, false);
+          }
+
+          // controller 115: apply preset settings and store these to the EEPROM
+          if (controller == 115)
+          {
+            preset_settings();
+            write_all_settings();
+            confirm_setting(controller, value, false);
+          }
+
+          // controller 116: normal MIDI note open (Hi-Hat)
+          if (controller == 116)
+          {
+            edrumulus.set_midi_note_open_norm(selected_pad, value);
+            edrumulus.write_setting(selected_pad, 12, value);
+            confirm_setting(controller, value, false);
+          }
+
+          // controller 117: MIDI note open (Hi-Hat) for rim
+          if (controller == 117)
+          {
+            edrumulus.set_midi_note_open_rim(selected_pad, value);
+            edrumulus.write_setting(selected_pad, 13, value);
+            confirm_setting(controller, value, false);
+          }
+
+          // controller 118: mask time
+          if (controller == 118)
+          {
+            edrumulus.set_mask_time(selected_pad, value);
+            edrumulus.write_setting(selected_pad, 14, value);
+            confirm_setting(controller, value, false);
+          }
+
+          // controller 119: rim shot boost
+          if (controller == 119)
+          {
+            edrumulus.set_rim_shot_boost(selected_pad, value);
+            edrumulus.write_setting(selected_pad, 15, value);
+            confirm_setting(controller, value, false);
+          }
+
+          // controller 120: pad coupling
+          if (controller == 120)
+          {
+            edrumulus.set_coupled_pad_idx(selected_pad, value);
+            edrumulus.write_setting(selected_pad, 16, value);
+            confirm_setting(controller, value, false);
+          }
+
+          // controller 121: rim positional sensing threshold
+          if (controller == 121)
+          {
+            edrumulus.set_rim_pos_threshold(selected_pad, value);
+            edrumulus.write_setting(selected_pad, 17, value);
+            confirm_setting(controller, value, false);
+          }
+
+          // controller 122: rim positional sensing sensitivity
+          if (controller == 122)
+          {
+            edrumulus.set_rim_pos_sensitivity(selected_pad, value);
+            edrumulus.write_setting(selected_pad, 18, value);
+            confirm_setting(controller, value, false);
+          }
+        }
+      }
+      vTaskDelay(TickDelay);
+    }
+  }
+}
+#endif
 
 void preset_settings()
 {
@@ -138,338 +586,15 @@ void preset_settings()
 
 void loop()
 {
-  static uint32_t LoopCounter = 0, MidiSends = 0;
   static unsigned long StatsTime = 0;
 
-  // this function is blocking at the system sampling rate
-  edrumulus.process();
-  LoopCounter ++;
+  static uint32_t R = 128, G = 0, B = 200;
+  neopixelWrite(RGB_BUILTIN, R, G / 2, B / 4);
 
-  // status LED handling
-  if (edrumulus.get_status_is_overload() || edrumulus.get_status_is_error())
-  {
-    if (!is_status_LED_on)
-    {
-      digitalWrite(status_LED_pin, HIGH);
-      is_status_LED_on = true;
-#ifdef USE_MIDI
-      if (edrumulus.get_status_is_error())
-      {
-        const int dc_offset_error_channel = edrumulus.get_status_dc_offset_error_channel();
-        if (dc_offset_error_channel >= 0)
-        {
-          // > 63 means DC offset error and pad/input index is coded in one value
-          MYMIDI.sendNoteOff(125, 64 + dc_offset_error_channel, 1);
-        }
-        else
-        {
-          // 1 means to set error state
-          MYMIDI.sendNoteOff(125, 1, 1);
-        }
-        MidiSends ++;
-      }
-#endif
-    }
-  }
-  else
-  {
-    if (is_status_LED_on)
-    {
-      digitalWrite(status_LED_pin, LOW);
-      is_status_LED_on = false;
-#ifdef USE_MIDI
-      MYMIDI.sendNoteOff(125, 0, 1); // 0 means that all errors are cleared
-      MidiSends ++;
-#endif
-    }
-  }
+  R = (R + 1) & 0xFF;
+  G = ((G + 3)) & 0x1FF;
+  B = ((B + 5)) & 0x2FF;
 
-#ifdef USE_MIDI
-  // send MIDI note to drum synthesizer
-  for (int pad_idx = 0; pad_idx < number_pads; pad_idx++)
-  {
-    if (edrumulus.get_peak_found(pad_idx))
-    {
-      // get current MIDI note and velocity (maybe note will be overwritten later on)
-      const int midi_velocity = edrumulus.get_midi_velocity(pad_idx);
-      int       midi_note     = edrumulus.get_midi_note(pad_idx);
-
-      // send midi positional control message if positional sensing is enabled for the current pad
-      if (edrumulus.get_pos_sense_is_used(pad_idx))
-      {
-        const int midi_pos = edrumulus.get_midi_pos(pad_idx);
-        MYMIDI.sendControlChange(16, midi_pos, midi_channel); // positional sensing
-        MidiSends ++;
-      }
-
-      // send Hi-Hat control message right before each Hi-Hat pad hit
-      if (pad_idx == hihat_pad_idx)
-      {
-        const int  midi_ctrl_ch    = edrumulus.get_midi_ctrl_ch(hihatctrl_pad_idx);
-        const int  midi_ctrl_value = edrumulus.get_midi_ctrl_value(hihatctrl_pad_idx);
-        const bool hi_hat_is_open  = edrumulus.get_midi_ctrl_is_open(hihatctrl_pad_idx);
-        MYMIDI.sendControlChange(midi_ctrl_ch, midi_ctrl_value, midi_channel);
-        MidiSends ++;
-
-        // if Hi-Hat is open, overwrite MIDI note
-        if (hi_hat_is_open)
-        {
-          midi_note = edrumulus.get_midi_note_open(pad_idx);
-        }
-      }
-
-      MYMIDI.sendNoteOn(midi_note, midi_velocity, midi_channel); // (note, velocity, channel)
-      MYMIDI.sendNoteOff(midi_note, 0, midi_channel);            // we need a note off
-      MidiSends += 2;
-    }
-
-    if (edrumulus.get_control_found(pad_idx))
-    {
-      const int midi_ctrl_ch    = edrumulus.get_midi_ctrl_ch(pad_idx);
-      const int midi_ctrl_value = edrumulus.get_midi_ctrl_value(pad_idx);
-      MYMIDI.sendControlChange(midi_ctrl_ch, midi_ctrl_value, midi_channel);
-      MidiSends ++;
-    }
-
-    if (edrumulus.get_choke_on_found(pad_idx))
-    {
-      // special case: if MIDI note open rim is set to zero, we use NoteOn instead of aftertouch
-      // for cymbal choke (#85), where the MIDI note for NoteOn is defined by MIDI note open norm
-      if (edrumulus.get_midi_note_open_rim(pad_idx) == 0)
-      {
-        // special case: if grabbed edge found, we send a MIDI NoteOn
-        const int midi_choke_noteon = edrumulus.get_midi_note_open_norm(pad_idx);
-        MYMIDI.sendNoteOn(midi_choke_noteon, 127, midi_channel);
-        MYMIDI.sendNoteOff(midi_choke_noteon, 0, midi_channel); // we need a note off
-        MidiSends += 2;
-      }
-      else
-      {
-        // if grabbed edge found, polyphonic aftertouch at 127 is transmitted for all notes of the pad
-        MYMIDI.MIDI_SEND_AFTER_TOUCH(edrumulus.get_midi_note_norm(pad_idx), 127, midi_channel);
-        MYMIDI.MIDI_SEND_AFTER_TOUCH(edrumulus.get_midi_note_rim(pad_idx), 127, midi_channel);
-        MYMIDI.MIDI_SEND_AFTER_TOUCH(edrumulus.get_midi_note_open_norm(pad_idx), 127, midi_channel);
-        MYMIDI.MIDI_SEND_AFTER_TOUCH(edrumulus.get_midi_note_open_rim(pad_idx), 127, midi_channel);
-        MidiSends += 4;
-      }
-    }
-    else if (edrumulus.get_choke_off_found(pad_idx))
-    {
-      // if released edge found, polyphonic aftertouch at 0 is transmitted for all notes of the pad
-      MYMIDI.MIDI_SEND_AFTER_TOUCH(edrumulus.get_midi_note_norm(pad_idx), 0, midi_channel);
-      MYMIDI.MIDI_SEND_AFTER_TOUCH(edrumulus.get_midi_note_rim(pad_idx), 0, midi_channel);
-      MYMIDI.MIDI_SEND_AFTER_TOUCH(edrumulus.get_midi_note_open_norm(pad_idx), 0, midi_channel);
-      MYMIDI.MIDI_SEND_AFTER_TOUCH(edrumulus.get_midi_note_open_rim(pad_idx), 0, midi_channel);
-      MidiSends += 4;
-    }
-  }
-
-  // receiving MIDI messages to change the pad settings: edrumuluscontrol.m -> loopMIDI -> Hairless MIDI
-  if (MYMIDI.read(midi_channel))
-  {
-    if (MYMIDI.getType() == MIDI_CONTROL_CHANGE_TYPE)
-    {
-      const int controller = MYMIDI.getData1();
-      const int value      = MYMIDI.getData2();
-
-      // controller 102: pad type
-      if (controller == 102)
-      {
-        edrumulus.set_pad_type(selected_pad, static_cast<Pad::Epadtype>(value));
-        edrumulus.write_setting(selected_pad, 0, value);
-
-        // on a pad type change, return all parameters of the selected pad
-        confirm_setting(controller, value, true);
-      }
-
-      // controller 103: threshold
-      if (controller == 103)
-      {
-        edrumulus.set_velocity_threshold(selected_pad, value);
-        edrumulus.write_setting(selected_pad, 1, value);
-        confirm_setting(controller, value, false);
-      }
-
-      // controller 104: sensitivity
-      if (controller == 104)
-      {
-        edrumulus.set_velocity_sensitivity(selected_pad, value);
-        edrumulus.write_setting(selected_pad, 2, value);
-        confirm_setting(controller, value, false);
-      }
-
-      // controller 105: positional sensing threshold
-      if (controller == 105)
-      {
-        edrumulus.set_pos_threshold(selected_pad, value);
-        edrumulus.write_setting(selected_pad, 3, value);
-        confirm_setting(controller, value, false);
-      }
-
-      // controller 106: positional sensing sensitivity
-      if (controller == 106)
-      {
-        edrumulus.set_pos_sensitivity(selected_pad, value);
-        edrumulus.write_setting(selected_pad, 4, value);
-        confirm_setting(controller, value, false);
-      }
-
-      // controller 107: rim shot threshold
-      if (controller == 107)
-      {
-        edrumulus.set_rim_shot_threshold(selected_pad, value);
-        edrumulus.write_setting(selected_pad, 5, value);
-        confirm_setting(controller, value, false);
-      }
-
-      // controller 108: select pad
-      if ((controller == 108) && (value < MAX_NUM_PADS))
-      {
-        selected_pad = value;
-
-        // on a pad selection, return all parameters of the selected pad
-        confirm_setting(controller, value, true);
-      }
-
-      // controller 109: MIDI curve type
-      if (controller == 109)
-      {
-        edrumulus.set_curve(selected_pad, static_cast<Pad::Ecurvetype>(value));
-        edrumulus.write_setting(selected_pad, 6, value);
-        confirm_setting(controller, value, false);
-      }
-
-      // controller 110: spike cancellation level
-      if (controller == 110)
-      {
-        edrumulus.set_spike_cancel_level(value);
-        edrumulus.write_setting(number_pads, 0, value);
-        confirm_setting(controller, value, false);
-      }
-
-      // controller 111: enable/disable rim shot and positional sensing support
-      if (controller == 111)
-      {
-        switch (value)
-        {
-          case 0:
-            edrumulus.set_rim_shot_is_used(selected_pad, false);
-            edrumulus.write_setting(selected_pad, 7, false);
-            edrumulus.set_pos_sense_is_used(selected_pad, false);
-            edrumulus.write_setting(selected_pad, 8, false);
-            break;
-          case 1:
-            edrumulus.set_rim_shot_is_used(selected_pad, true);
-            edrumulus.write_setting(selected_pad, 7, true);
-            edrumulus.set_pos_sense_is_used(selected_pad, false);
-            edrumulus.write_setting(selected_pad, 8, false);
-            break;
-          case 2:
-            edrumulus.set_rim_shot_is_used(selected_pad, false);
-            edrumulus.write_setting(selected_pad, 7, false);
-            edrumulus.set_pos_sense_is_used(selected_pad, true);
-            edrumulus.write_setting(selected_pad, 8, true);
-            break;
-          case 3:
-            edrumulus.set_rim_shot_is_used(selected_pad, true);
-            edrumulus.write_setting(selected_pad, 7, true);
-            edrumulus.set_pos_sense_is_used(selected_pad, true);
-            edrumulus.write_setting(selected_pad, 8, true);
-            break;
-        }
-        confirm_setting(controller, value, false);
-      }
-
-      // controller 112: normal MIDI note
-      if (controller == 112)
-      {
-        edrumulus.set_midi_note_norm(selected_pad, value);
-        edrumulus.write_setting(selected_pad, 9, value);
-        confirm_setting(controller, value, false);
-      }
-
-      // controller 113: MIDI note for rim
-      if (controller == 113)
-      {
-        edrumulus.set_midi_note_rim(selected_pad, value);
-        edrumulus.write_setting(selected_pad, 10, value);
-        confirm_setting(controller, value, false);
-      }
-
-      // controller 114: cross talk cancellation
-      if (controller == 114)
-      {
-        edrumulus.set_cancellation(selected_pad, value);
-        edrumulus.write_setting(selected_pad, 11, value);
-        confirm_setting(controller, value, false);
-      }
-
-      // controller 115: apply preset settings and store these to the EEPROM
-      if (controller == 115)
-      {
-        preset_settings();
-        write_all_settings();
-        confirm_setting(controller, value, false);
-      }
-
-      // controller 116: normal MIDI note open (Hi-Hat)
-      if (controller == 116)
-      {
-        edrumulus.set_midi_note_open_norm(selected_pad, value);
-        edrumulus.write_setting(selected_pad, 12, value);
-        confirm_setting(controller, value, false);
-      }
-
-      // controller 117: MIDI note open (Hi-Hat) for rim
-      if (controller == 117)
-      {
-        edrumulus.set_midi_note_open_rim(selected_pad, value);
-        edrumulus.write_setting(selected_pad, 13, value);
-        confirm_setting(controller, value, false);
-      }
-
-      // controller 118: mask time
-      if (controller == 118)
-      {
-        edrumulus.set_mask_time(selected_pad, value);
-        edrumulus.write_setting(selected_pad, 14, value);
-        confirm_setting(controller, value, false);
-      }
-
-      // controller 119: rim shot boost
-      if (controller == 119)
-      {
-        edrumulus.set_rim_shot_boost(selected_pad, value);
-        edrumulus.write_setting(selected_pad, 15, value);
-        confirm_setting(controller, value, false);
-      }
-
-      // controller 120: pad coupling
-      if (controller == 120)
-      {
-        edrumulus.set_coupled_pad_idx(selected_pad, value);
-        edrumulus.write_setting(selected_pad, 16, value);
-        confirm_setting(controller, value, false);
-      }
-
-      // controller 121: rim positional sensing threshold
-      if (controller == 121)
-      {
-        edrumulus.set_rim_pos_threshold(selected_pad, value);
-        edrumulus.write_setting(selected_pad, 17, value);
-        confirm_setting(controller, value, false);
-      }
-
-      // controller 122: rim positional sensing sensitivity
-      if (controller == 122)
-      {
-        edrumulus.set_rim_pos_sensitivity(selected_pad, value);
-        edrumulus.write_setting(selected_pad, 18, value);
-        confirm_setting(controller, value, false);
-      }
-    }
-  }
-#endif
   if((millis() - StatsTime) >= 1000)
   {
     StatsTime = millis();
@@ -477,6 +602,7 @@ void loop()
     Serial.printf("Stats: Loops %d, Midi %d\r\n", LoopCounter, MidiSends);
     LoopCounter = 0, MidiSends = 0;
   }
+  delay(20);
 }
 
 #ifdef USE_MIDI
