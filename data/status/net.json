@@ -1,0 +1,10 @@
+{
+  "TableName": "Net Settings",
+  "UpdateRate": 60000,
+  "Columns": 4,
+  "Elements": [
+         { "SSID": ["MyWifi", "net0", "1"] },
+         { "Password": ["MyWifiPassword", "net1", "1"] },
+         { "Net Name": ["EDrumulus", "net2", "1"] }
+  ]
+}

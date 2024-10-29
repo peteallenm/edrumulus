@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html>
+  <head>
+  <style>
+    .chart-container {
+      margin: 20px;
+      font-family: Arial, sans-serif;
+    }
+    
+    .axis-label {
+      font-size: 12px;
+    }
+    
+    .bar {
+      transition: fill 0.3s;
+    }
+    
+    .bar:hover {
+      fill: #45a049;
+    }
+  </style>  
+  <title>EDrumulus</title>
+    <meta charset="utf-8">
+    <base target="_top">
+    <link rel="stylesheet" href="support/GreenNeat.css#inline" >
+    <script src="support/jquery.js#inline"></script>
+    <script src="support/Script.js#inline"></script>
+    <script src="https://canvasjs.com/assets/script/jquery.canvasjs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+    </script>
+  </head>
+  <body>
+  <ul>
+  <li> <a href='index.html'>Main Page</a></li>
+  <li> <a href='visualisation.html'>Visualisation</a></li>
+</ul>
+<br /> <br />  
+    <h2> Pad position visualisation </h2>
+    <div id="padposition"></div>
+    <div id="padposition_button"></div>
+    
+    <h2> Signal graph </h2>
+  <div id="visualization">  </div>
+  </body>
+  <script>
+
+const margin = { top: 20, right: 50, bottom: 50, left: 60 };
+const width = 512 - margin.left - margin.right;
+const height = 512 - margin.top - margin.bottom;
+LastProcessedHit = 0;
+
+$(document).ready(function() {
+    // Create SVG container
+    const svg = d3.select('#padposition')
+        .append('svg')
+        .attr('width', 512)
+        .attr('height', 512)
+        .style('border', '1px solid #ccc');
+    // Create power_svg container
+        const power_svg = d3.select('#visualization')
+            .append('svg')
+            .attr('width', width + margin.left + margin.right)
+            .attr('height', height + margin.top + margin.bottom)
+            .append('g')
+            .attr('transform', `translate(${margin.left},${margin.top})`);
+        const xScale = d3.scaleLinear()
+            .range([0, width]);
+
+        const yScale = d3.scaleLinear()
+            .range([height, 0]);
+
+
+  const xAxis = power_svg.append('g')
+        .attr('transform', `translate(0,${height})`);
+
+    xAxis.append('text')
+        .attr('x', width / 2)
+        .attr('y', 40)
+        .attr('fill', 'black')
+        .text('Time');
+
+    // Add Y axis
+    const yAxis = power_svg.append('g');
+
+    yAxis.append('text')
+        .attr('transform', 'rotate(-90)')
+        .attr('y', -40)
+        .attr('x', -height / 2)
+        .attr('fill', 'black')
+        .text('Power');
+        // Add legend
+        const legend = power_svg.append('g')
+            .attr('transform', `translate(${width - 100}, 20)`);
+
+        legend.append('line')
+            .attr('x1', 0)
+            .attr('y1', 8)
+            .attr('x2', 15)
+            .attr('y2', 8)
+            .attr('stroke-width', 15)
+            .attr('stroke', 'steelblue');
+
+        legend.append('text')
+            .attr('x', 20)
+            .attr('y', 12)
+            .text('Power');
+
+        legend.append('line')
+            .attr('x1', 0)
+            .attr('x2', 15)
+            .attr('y1', 30)
+            .attr('y2', 30)
+            .attr('stroke', 'red')
+            .attr('stroke-width', 2);
+
+        legend.append('text')
+            .attr('x', 20)
+            .attr('y', 35)
+            .text('Threshold');
+
+        legend.append('line')
+            .attr('x1', 0)
+            .attr('x2', 15)
+            .attr('y1', 50)
+            .attr('y2', 50)
+            .attr('stroke', 'green')
+            .attr('stroke-width', 2);
+
+        legend.append('text')
+            .attr('x', 20)
+            .attr('y', 55)
+            .text('Position');
+    
+    function do_pad_data_graph () {
+        $.getJSON('status/pad_hit_data.json', (loadedData) => {
+            updateChart(loadedData);
+        });
+    }
+function updateChart(data) {
+    // Expected data format:
+            // {
+            //     "line1": [1, 2, 3, ...],
+            //     "line2": [4, 5, 6, ...],
+            //     "line3": [7, 8, 9, ...]
+            // }
+            const lines = [
+                { name: 'Line 1', color: 'steelblue' },
+                { name: 'Line 2', color: 'red' },
+                { name: 'Line 3', color: 'green' }
+            ];
+            // Update scales
+            const maxLength = Math.max(
+                data.powerValues.length,
+                data.thresholdPoints.length,
+                data.positionPoints.length
+            );
+            
+            xScale.domain([0, maxLength - 1]);
+            
+            const maxValue = Math.max(
+                d3.max(data.powerValues),
+                d3.max(data.thresholdPoints),
+                d3.max(data.positionPoints)
+            );
+            
+            yScale.domain([0, maxValue]);
+
+            // Update axes
+            xAxis.call(d3.axisBottom(xScale));
+            yAxis.call(d3.axisLeft(yScale));
+
+            // Line generator
+            const lineGenerator = d3.line()
+                .x((d, i) => xScale(i))
+                .y(d => yScale(d));
+
+            // Update lines
+            const lineData = [data.powerValues, data.thresholdPoints, data.positionPoints];
+            
+            lines.forEach((line, i) => {
+                power_svg.selectAll(`.line${i + 1}`)
+                    .data([lineData[i]])
+                    .join('path')
+                    .attr('class', `line${i + 1}`)
+                    .attr('fill', 'none')
+                    .attr('stroke', line.color)
+                    .attr('stroke-width', 2)
+                    .transition()
+                    .duration(500)
+                    .attr('d', lineGenerator);
+            });
+}
+
+    // Function to create and animate a single circle
+    function createCircle(circleData) {
+        // Create main circle with lifecycle
+        svg.append('circle')
+            .attr('cx', circleData.x)
+            .attr('cy', circleData.y)
+            .attr('r', 0)
+            .attr('class', 'main-circle')
+            .style('fill', '#4682b4')
+            .style('opacity', 0.7)
+            // Grow to full size
+            .transition()
+            .duration(500)
+            .attr('r', circleData.size)
+            // Hold at full size
+            .transition()
+            .delay(200)
+            // Shrink and fade
+            .transition()
+            .duration(1000)
+            .attr('r', 0)
+            .style('opacity', 0)
+            .remove();
+
+        // Create ripple effect
+        svg.append('circle')
+            .attr('class', 'ripple')
+            .attr('cx', circleData.x)
+            .attr('cy', circleData.y)
+            .attr('r', circleData.size)
+            .style('fill', 'none')
+            .style('stroke', '#4682b4')
+            .style('stroke-width', 2)
+            .style('opacity', 0.5)
+            .transition()
+            .duration(1500)
+            .attr('r', circleData.size * 2)
+            .style('opacity', 0)
+            .remove();
+    }
+
+    // Function to load and process data
+    function loadAndAnimateCircles() {
+        $.getJSON('status/drumxy.json', function(data) {
+            if(data.NumHits != LastProcessedHit)
+            {
+                LastProcessedHit = data.NumHits;
+                
+                HitData = data.HitData;
+                // Process each circle independently
+                HitData.forEach((circleData, index) => {
+                    // Stagger the creation slightly for visual interest
+                    setTimeout(() => {
+                        createCircle(circleData);
+                    }, index * 10); // 10ms delay between each circle start
+                });
+                
+                do_pad_data_graph();
+            }
+        }).fail(function(jqXHR, textStatus, errorThrown) {
+            const errorDiv = d3.select('body')
+                .append('div')
+                .style('color', 'red')
+                .text(`Error loading data: ${errorThrown}`);
+            
+            console.error('Error loading data:', errorThrown);
+        });
+    }
+    
+    // Add reload button
+    d3.select('#padposition_button')
+        .append('button')
+        .text('Restart plotting')
+        .style('margin', '10px')
+        .on('click', loadAndAnimateCircles);
+
+    svg.append('circle')
+            .attr('cx', 256)
+            .attr('cy', 256)
+            .attr('r', 256)
+            .style('fill', 'none')
+            .style('stroke', '#4682b4')
+            .style('stroke-width', 4)
+            .style('opacity', 1)
+    // Initial load
+    //loadAndAnimateCircles();
+      
+    window.autoReloadInterval = setInterval(loadAndAnimateCircles, 500);
+    // Cleanup on page unload
+    window.addEventListener('beforeunload', function() {
+        if (window.autoReloadInterval) {
+            clearInterval(window.autoReloadInterval);
+        }
+    });
+
+    // Add stats display
+    const statsDiv = d3.select('body')
+        .append('div')
+        .style('margin', '10px')
+        .style('font-family', 'monospace');
+
+    // Update stats periodically
+    setInterval(() => {
+        const activeCircles = svg.selectAll('circle.main-circle').size();
+        const activeRipples = svg.selectAll('circle.ripple').size();
+        statsDiv.text(`Active circles: ${activeCircles} | Active ripples: ${activeRipples}`);
+    }, 100);
+});
+</script>
+</html>
+

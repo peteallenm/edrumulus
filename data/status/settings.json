@@ -1,0 +1,14 @@
+{
+  "TableName": "Settings Table",
+  "UpdateRate": 60000,
+  "Columns": 3,
+  "Elements": [
+         { "MotorPGain": ["200", "settings0", "1"] },
+         { "MotorIGain": ["20", "settings1", "1"] },
+         { "MotorPIDDiv": ["100", "settings2", "1"] },
+         { "MotorPMax": ["6000", "settings3", "1"] },
+         { "ManualControl": ["0", "settings4", "1"] },
+         { "DeadMansTimer": ["5000", "settings5", "1"] },
+         { "PWMTickVal": ["0", "settings6", "1"] }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "TableName": "Status Table",
+  "UpdateRate": 1000,
+  "Columns": 4,
+  "Elements": [
+         { "Pad0 Name": ["Kick", "status0", "0"] },
+         { "Pad0 Hits": ["0", "status1", "0"] },
+         { "LastHit Velocity": ["0", "status2", "0"] },
+         { "LastHit Position": ["0", "status3", "0"] },
+         { "Pad1 Name": ["Snare Main", "status4", "0"] },
+         { "Pad1 Hits": ["10", "status5", "0"] },
+         { "LastHit Velocity": ["85", "status6", "0"] },
+         { "LastHit Position": ["34", "status7", "0"] },
+         { "Pad2 Name": ["Snare Rim", "status8", "0"] },
+         { "Pad2 Hits": ["2", "status9", "0"] },
+         { "LastHit Velocity": ["46", "status10", "0"] },
+         { "LastHit Position": ["0", "status11", "0"] }
+  ]
+}

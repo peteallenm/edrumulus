@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+  <head>
+  <title>EDrumulus</title>
+    <meta charset="utf-8">
+    <base target="_top">
+    <link rel="stylesheet" href="support/GreenNeat.css#inline" >
+    <script src="support/jquery.js#inline"></script>
+    <script src="support/Script.js#inline"></script>
+    <script src="https://canvasjs.com/assets/script/jquery.canvasjs.min.js"></script>
+  </head>
+  <body>
+  <ul>
+  <li> <a href='index.html'>Main Page</a></li>
+  <li> <a href='visualisation.html'>Visualisation</a></li>
+</ul>
+    <h3> Status</h3>
+	  <!-- ============================== Fieldset 1 ============================== -->
+        <form action="index.html" method="get">
+	  <fieldset>
+	    <legend id="activity_title">Status:</legend>
+            <table id="status" class="plain"></table>
+	  </fieldset>
+	</form>	
+    <h2> Pad Settings</h2>
+	<form action="index.html" method="get">
+	  <fieldset>
+		<legend>Pad Settings</legend>
+		<table id="padsettings" class="plain">
+		</table>
+	  </fieldset>
+	</form>
+	<!-- ============================== Fieldset 4 end ============================== -->
+  </body>
+  <script>
+$( document ).ready(function() {
+    loadTable("status");
+    loadTable("padsettings");
+});
+
+</script>
+</html>
+

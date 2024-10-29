@@ -14,7 +14,7 @@
  * this program; if not, write to the Free Software Foundation, Inc.,
  * 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 \******************************************************************************/
-
+#include "GenUtils.h"
 #include "pad.h"
 
 void Pad::setup(const int conf_Fs)
@@ -800,6 +800,7 @@ float Pad::process_sample(const float* input,
                    threshold);
   return x_filt; // here, you can return debugging values for verification with Ocatve
 }
+
 
 void Pad::process_control_sample(const int* input,
                                  bool&      change_found,

@@ -1,0 +1,12 @@
+{
+  "TableName": "Current Status",
+  "UpdateRate": 1000,
+  "Columns": 3,
+  "Elements": [
+         { "Room Temp": ["19.2", "current0", "0"] },
+         { "Outside Temp": ["8.6", "current1", "0"] },
+         { "Humidity": ["66.2", "current2", "0"] },
+         { "Current Time": ["22:06:01", "current3", "0"] },
+         { "Music Timer": ["0", "current4", "0"] }
+  ]
+}

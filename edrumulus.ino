@@ -15,8 +15,10 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 \******************************************************************************/
 
+
 #define USE_MIDI
 #define USE_TINYUSB
+#define USE_WIFI
 // ESP32 default pin definition ("-1" means that this channel is unused):
 // For older prototypes or custom implementations, simply change the GPIO numbers in the table below
 // to match your hardware (note that the GPIO assignment of Prototype 2 is the same as Prototype 4).
@@ -32,6 +34,18 @@ static int analog_pins_rimshot4[] = {  4,     -1,      8,       -1,         10, 
 const int number_pads4 = 1; // example: just one single pad
 
 #define MIDI_QUEUE_LEN 5
+
+#ifdef USE_WIFI
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <WiFiClient.h>
+#include <SPIFFS.h>
+#include <FS.h>
+#include "GenUtils.h"
+
+#endif
 
 #include "edrumulus.h"
 
@@ -90,7 +104,39 @@ xQueueHandle MidiTxQueue = NULL;
 
 #endif
 
+#ifdef USE_WIFI
+
+typedef struct 
+{
+  int32_t PosX;
+  int32_t PosY;
+  uint32_t Power;
+  uint32_t NumHits;
+} HIT_DATA;
+
+HIT_DATA LastHit = {0};
+
+void SetupWebpages(void);
+
+void DoDrumXYJson(void);
+void DoPadHitDataJson(void);
+void DoVisualisationPage(void);
+void DoStatusJson(void);
+void DoPadSettingsJson(void);
+
+void DoRootPage(void);
+
+char *DefaultSSID = "MyWifiName";
+char *DefaultPassword = "MyWifiPassword";
+char *DefaultNetName = "EDrumulus";
+WiFiServer ApServer(80);
+WebServer server(80);
+uint32_t CurrentDisplayPad = 0;
+
+#endif
+
 static uint32_t LoopCounter = 0, MidiSends = 0;
+static uint32_t LoopsPerSecond = 0, MidiPerSecond = 0;
 
 void EDrumulusTask(void *pArg);
 void MidiTask(void *pArg);
@@ -99,7 +145,7 @@ bool SendMidiMsg(MIDI_MSG_TYPE Type, char Note, char Vel, char Chan);
 
 void setup()
 {
-  for (int i = 0; i < 5; i++)
+  for (int i = 0; i < 4; i++)
   {
     neopixelWrite(RGB_BUILTIN, 255, 255, 255);
     delay(100);
@@ -111,7 +157,8 @@ void setup()
     TinyUSBDevice.begin(0);
   }
   Serial.begin(115200);
-  Serial.printf("\n\n\n\n\rStart\r\n\n\n\n\n");
+  Serial.printf("\n\n\rStarting eDrumulus\r\n\n");
+  
   // get the pin-to-pad assignments
   int*      analog_pins         = analog_pins4;         // initialize with the default setup
   int*      analog_pins_rimshot = analog_pins_rimshot4; // initialize with the default setup
@@ -121,7 +168,8 @@ void setup()
                                                                &status_LED_pin);
   analog_pins         = analog_pins4;         // override get_prototype_pins
   analog_pins_rimshot = analog_pins_rimshot4; 
-
+  number_pads = 1;
+  
   // initialize GPIO port for status LED and set it to on during setup
   pinMode(status_LED_pin, OUTPUT);
   digitalWrite(status_LED_pin, HIGH);
@@ -153,9 +201,11 @@ void setup()
   number_pads = min(number_pads, 7); // only max. 7 pads are supported for ESP32 serial debug plotting
 #endif
 
+#ifdef USE_WIFI
+  SetupWebpages();
+#endif
 
 #ifdef USE_MIDI
-
   MidiTxQueue = xQueueCreate(MIDI_QUEUE_LEN, sizeof(MidiMessage));
   if((!MidiTxQueue))
   {
@@ -233,6 +283,10 @@ void EDrumulusTask(void *pArg)
         {
           const int midi_pos = edrumulus.get_midi_pos(pad_idx);
           SendMidiMsg(MIDI_CONTROL, 16, midi_pos, midi_channel); // positional sensing
+          if(pad_idx == CurrentDisplayPad)
+          {
+            LastHit.PosX = midi_pos;
+          }
         }
 
         // send Hi-Hat control message right before each Hi-Hat pad hit
@@ -249,7 +303,13 @@ void EDrumulusTask(void *pArg)
             midi_note = edrumulus.get_midi_note_open(pad_idx);
           }
         }
-        //Serial.printf("%x, %x, %x, %x\r\n", (int)MIDI_NOTEON, midi_note, midi_velocity, midi_channel);
+        /* This stores data for the webpage display */
+        if(pad_idx == CurrentDisplayPad)
+        {
+          LastHit.Power = midi_velocity;
+          LastHit.NumHits ++;
+        }
+        
         SendMidiMsg(MIDI_NOTEON, midi_note, midi_velocity, midi_channel); // (note, velocity, channel)
         SendMidiMsg(MIDI_NOTEOFF, midi_note, 0, midi_channel);            // we need a note off
       }
@@ -300,7 +360,7 @@ bool SendMidiMsg(MIDI_MSG_TYPE Type, char Note, char Vel, char Chan)
   {
     MidiMessage Msg = {.Type = Type, .Note = Note, .Vel = Vel, .Chan = Chan}; 
     
-    if (xQueueSend(MidiTxQueue, &Msg, portMAX_DELAY) != pdPASS)
+    if (xQueueSend(MidiTxQueue, &Msg, 0) != pdPASS)
     {
       Serial.println("SendMidiMsg() Out of Midi TX Queue space");
       return false;
@@ -573,7 +633,7 @@ void preset_settings()
   edrumulus.set_midi_notes(8, 43, 58);                 // tom 3
 
   // default drum kit setup
-  edrumulus.set_pad_type(0, Pad::PD8);  // snare
+  edrumulus.set_pad_type(0, Pad::PDX8);  // snare
   edrumulus.set_pad_type(1, Pad::KD7);  // kick
   edrumulus.set_pad_type(2, Pad::PD6);  // Hi-Hat
   edrumulus.set_pad_type(3, Pad::FD8);  // Hi-Hat-ctrl
@@ -588,21 +648,28 @@ void loop()
 {
   static unsigned long StatsTime = 0;
 
-  static uint32_t R = 128, G = 0, B = 200;
-  neopixelWrite(RGB_BUILTIN, R, G / 2, B / 4);
+  static uint8_t R = 0, G = 0, B = 0;
+  neopixelWrite(RGB_BUILTIN, 0, 255 - R, R);
 
-  R = (R + 1) & 0xFF;
-  G = ((G + 3)) & 0x1FF;
-  B = ((B + 5)) & 0x2FF;
+  R++;
+  
+  //G = ((G + 2)) & 0xFF;
+  //B = ((B + 3)) & 0xFF;
 
   if((millis() - StatsTime) >= 1000)
   {
     StatsTime = millis();
 
     Serial.printf("Stats: Loops %d, Midi %d\r\n", LoopCounter, MidiSends);
+    LoopsPerSecond = LoopCounter;
+    MidiPerSecond = MidiSends;
     LoopCounter = 0, MidiSends = 0;
   }
-  delay(20);
+
+#ifdef USE_WIFI
+  server.handleClient();
+#endif
+  delay(10);
 }
 
 #ifdef USE_MIDI
@@ -644,6 +711,229 @@ void confirm_setting(const int  controller,
     MYMIDI.sendNoteOff(controller, value, 1); // can be checked, e.g., in the log file
   }
 }
+#endif
+
+
+
+#ifdef USE_WIFI
+void SetupWebpages(void)
+{
+
+  SPIFFS.begin();
+
+  ConnectToWifi(DefaultSSID, DefaultPassword, DefaultNetName);
+
+  char result[16];
+  sprintf(result, "%d.%d.%d.%d", WiFi.localIP()[0], WiFi.localIP()[1], WiFi.localIP()[2], WiFi.localIP()[3]);
+
+  Serial.println("WiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+  
+  MDNS.begin(DefaultNetName);
+
+
+  MDNS.addService("http", "tcp", 80);
+
+  WiFiClient Client = server.client();
+  Client.setNoDelay(1);
+
+  server.on("/", HTTP_GET, DoRootPage);
+  server.on("/index.html", HTTP_GET, DoRootPage);
+  server.on("/visualisation.html", HTTP_GET, DoVisualisationPage);
+
+  server.serveStatic("/support", SPIFFS, "/support", "max-age=31536000");
+
+  server.on("/status/status.json", HTTP_GET, DoStatusJson);
+  server.on("/status/padsettings.json", HTTP_GET, DoPadSettingsJson);
+  server.on("/status/drumxy.json", HTTP_GET, DoDrumXYJson);
+  server.on("/status/pad_hit_data.json", HTTP_GET, DoPadHitDataJson);
+  server.begin();
+
+}
+
+String AddJSonArray(int32_t *Arr, uint32_t Len)
+{
+  String Content = "";
+  if((NULL != Arr) && (Len > 0))
+  {
+    for (int i = 0; i < Len; i++)
+    {
+      
+      Content += String(Arr[i]);
+      if(i < (Len - 1))
+      {
+        Content += ",";
+      }
+    }
+  }
+  else{
+    Serial.println("AddJSonArray: invalid array");
+  }
+  return Content;
+}
+
+String AddJSonElement(char *Name, int32_t Val)
+{
+  return "\"" + String(Name) + "\":" + String(Val);
+}
+
+String AddJSonArrayXY(int32_t *ArrX, int32_t *ArrY, uint32_t Len)
+{
+  if((NULL != ArrX) && (NULL != ArrY) && (Len > 0))
+  {
+    String Content = "";
+    for (int i = 0; i < Len; i++)
+    {
+      Content += "{\"x\":" + String(ArrX[i]) + ",\"y\":" + String(ArrY[i]) + "}";
+      if(i < (Len - 1))
+      {
+        Content += ",";
+      }
+    }
+    return Content;
+  }
+  else{
+    Serial.println("AddJSonArrayXY: invalid array");
+    return "";
+  }
+}
+
+/* [
+ {"x": 300, "y": 256, "size": 60, "id": "circle1"},
+ {"x": 500, "y": 256, "size": 20, "id": "circle2"}
+] */
+void DoDrumXYJson(void)
+{
+  String Content = "{\n  \"NumHits\":";
+  Content += String(LastHit.NumHits) + ",\n";
+  Content += "  \"HitData\": [\n  {";
+  Content += AddJSonElement("x", LastHit.PosX * 2 + 256);
+  Content += ",";
+  Content += AddJSonElement("y", LastHit.PosY * 2 + 256);
+  Content += ",";
+  int Power = LastHit.Power / 2;
+  if(Power < 2)
+    Power = 2;
+  Content += AddJSonElement("size", LastHit.Power / 2);
+  Content += ", \"id\": \"circle1\"";
+  Content += "  }\n  ]\n}";
+  server.send(200, "application/json", Content);
+}
+#if 0
+void DoPadHitDataJson(void)
+{
+  String Content = "{\n";
+  Content += "\"powerValues\": [";
+  Content += AddJSonArray(LastHit.Data, LastHit.DataLen);
+  Content += "],\n \"thresholdPoints\": [";
+  Content += AddJSonArrayXY(LastHit.ThresholdX, LastHit.ThresholdY, LastHit.ThresholdLen);
+  Content += "],\n \"positionPoints\": [";
+  Content += AddJSonArrayXY(LastHit.PositionX, LastHit.PositionY, LastHit.PositionLen);
+  Content += "  ]\n}";
+  
+  server.send(200, "application/json", Content);
+}
+#endif
+void DoPadHitDataJson(void)
+{
+  String Content = "{\n";
+  Content += "\"powerValues\": [";
+  Content += GET_DEBUG_BUFFER(0);
+  Content += "],\n \"thresholdPoints\": [";
+  Content += GET_DEBUG_BUFFER(1);
+  Content += "],\n \"positionPoints\": [";
+  Content += GET_DEBUG_BUFFER(2);
+  Content += "  ]\n}";
+  
+  server.send(200, "application/json", Content);
+}
+void DoVisualisationPage(void)
+{
+  File file = SPIFFS.open("/visualisation.html", "r");
+  size_t sent = server.streamFile(file, "text/html");
+  if (0 == sent)
+  {
+    Serial.println("DoVisualisationPage file length 0");
+  }
+  file.close();
+}
+
+
+#define STATUS_TABLE_ROWS 2
+WEBTABLE_ROW StatusTableRows[STATUS_TABLE_ROWS] = {
+  {"ADC Loops/second",      false,      &LoopsPerSecond,      "%d",    sizeof(int32_t)},
+  {"Midi messages/second",  false,      &MidiPerSecond,       "%d",    sizeof(int32_t)}
+};
+
+WEBTABLE StatusTable = { "Status Table", "status", STATUS_TABLE_ROWS, 1000, 4, StatusTableRows};
+void DoStatusJson(void)
+{
+  WebTableWriteJson(&StatusTable, &server);
+}
+
+uint32_t PadType = 0;
+int32_t VelocityThreshold = 0;
+int32_t VelocitySensitivity = 0;
+int32_t PosThreshold = 0;
+int32_t PosSensitivity = 0;
+
+#define PAD_SETTINGS_TABLE_ROWS 6
+WEBTABLE_ROW PadSettingsTableRows[PAD_SETTINGS_TABLE_ROWS] = {
+  {"Selected Pad",          true,      &selected_pad,          "%d",    sizeof(uint32_t)},
+  {"Pad Type",              true,      &PadType,               "%d",    sizeof(uint32_t)},
+  {"Velocitiy Sensitivity", true,      &VelocitySensitivity,   "%d",    sizeof(int32_t)},
+  {"Velocity Threshold",    true,      &VelocityThreshold,     "%d",    sizeof(int32_t)},
+  {"Pos Sensitivity",       true,      &PosSensitivity,        "%d",    sizeof(int32_t)},
+  {"Pos Threshold",         true,      &PosThreshold,          "%d",    sizeof(int32_t)}
+};
+
+
+WEBTABLE PadSettings = { "Pad Settings Table", "pad_settings", PAD_SETTINGS_TABLE_ROWS, 60 * 1000, 4, PadSettingsTableRows};
+
+void DoPadSettingsJson(void)
+{
+  
+  PadType = (uint32_t)edrumulus.get_pad_type(selected_pad);
+  VelocityThreshold   = edrumulus.get_velocity_threshold(selected_pad);
+  VelocitySensitivity = edrumulus.get_velocity_sensitivity(selected_pad);
+  PosSensitivity = edrumulus.get_pos_sensitivity(selected_pad);
+  PosThreshold = edrumulus.get_pos_threshold(selected_pad);
+
+  WebTableWriteJson(&PadSettings, &server);
+}
+void DoRootPage(void)
+{
+  File file = SPIFFS.open("/index.html", "r");
+  size_t sent = server.streamFile(file, "text/html");
+  if (0 == sent)
+  {
+    Serial.println("DoRootPage file length 0");
+  }
+  file.close();
+  
+  if (server.args() != 0)
+  {
+    if (WebTableProcessSet(&PadSettings, &server))
+    {
+      edrumulus.set_pad_type(selected_pad, static_cast<Pad::Epadtype>(PadType));
+      edrumulus.write_setting(selected_pad, 0, PadType);
+    
+      edrumulus.set_velocity_threshold(selected_pad, VelocityThreshold);
+      edrumulus.write_setting(selected_pad, 1, VelocityThreshold);
+      
+      edrumulus.set_velocity_sensitivity(selected_pad, VelocitySensitivity);
+      edrumulus.write_setting(selected_pad, 2, VelocitySensitivity);
+      
+      edrumulus.set_pos_threshold(selected_pad, PosSensitivity);
+      edrumulus.write_setting(selected_pad, 3, PosSensitivity);
+      
+      edrumulus.set_pos_sensitivity(selected_pad, PosThreshold);
+      edrumulus.write_setting(selected_pad, 4, PosThreshold);
+    }
+  }
+}
+
 #endif
 
 void read_settings()
