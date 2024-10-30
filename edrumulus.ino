@@ -126,17 +126,18 @@ void DoPadSettingsJson(void);
 
 void DoRootPage(void);
 
-char *DefaultSSID = "MyWifiName";
-char *DefaultPassword = "MyWifiPassword";
+char *DefaultSSID = "Alien";
+char *DefaultPassword = "the pheasant has no agenda";
 char *DefaultNetName = "EDrumulus";
 WiFiServer ApServer(80);
 WebServer server(80);
 uint32_t CurrentDisplayPad = 0;
 
 #endif
-
+int32_t MaxPeak = 0;
+float MaxPeakF = 0;
 static uint32_t LoopCounter = 0, MidiSends = 0;
-static uint32_t LoopsPerSecond = 0, MidiPerSecond = 0;
+static uint32_t LoopsPerSecond = 0, MidiPerSecond = 0, IdlesPerSecond = 0;
 
 void EDrumulusTask(void *pArg);
 void MidiTask(void *pArg);
@@ -647,6 +648,7 @@ void preset_settings()
 void loop()
 {
   static unsigned long StatsTime = 0;
+  static int32_t Idles = 0;
 
   static uint8_t R = 0, G = 0, B = 0;
   neopixelWrite(RGB_BUILTIN, 0, 255 - R, R);
@@ -663,13 +665,15 @@ void loop()
     Serial.printf("Stats: Loops %d, Midi %d\r\n", LoopCounter, MidiSends);
     LoopsPerSecond = LoopCounter;
     MidiPerSecond = MidiSends;
-    LoopCounter = 0, MidiSends = 0;
+    IdlesPerSecond = Idles;
+    LoopCounter = 0, MidiSends = 0, Idles = 0;
   }
 
 #ifdef USE_WIFI
   server.handleClient();
 #endif
-  delay(10);
+   Idles ++;
+  delay(5);
 }
 
 #ifdef USE_MIDI
@@ -808,33 +812,19 @@ void DoDrumXYJson(void)
   String Content = "{\n  \"NumHits\":";
   Content += String(LastHit.NumHits) + ",\n";
   Content += "  \"HitData\": [\n  {";
-  Content += AddJSonElement("x", LastHit.PosX * 2 + 256);
+  Content += AddJSonElement("x", LastHit.PosX + 256);
   Content += ",";
   Content += AddJSonElement("y", LastHit.PosY * 2 + 256);
   Content += ",";
   int Power = LastHit.Power / 2;
-  if(Power < 2)
-    Power = 2;
-  Content += AddJSonElement("size", LastHit.Power / 2);
+  if(Power < 5)
+    Power = 5;
+  Content += AddJSonElement("size", Power);
   Content += ", \"id\": \"circle1\"";
   Content += "  }\n  ]\n}";
   server.send(200, "application/json", Content);
 }
-#if 0
-void DoPadHitDataJson(void)
-{
-  String Content = "{\n";
-  Content += "\"powerValues\": [";
-  Content += AddJSonArray(LastHit.Data, LastHit.DataLen);
-  Content += "],\n \"thresholdPoints\": [";
-  Content += AddJSonArrayXY(LastHit.ThresholdX, LastHit.ThresholdY, LastHit.ThresholdLen);
-  Content += "],\n \"positionPoints\": [";
-  Content += AddJSonArrayXY(LastHit.PositionX, LastHit.PositionY, LastHit.PositionLen);
-  Content += "  ]\n}";
-  
-  server.send(200, "application/json", Content);
-}
-#endif
+
 void DoPadHitDataJson(void)
 {
   String Content = "{\n";
@@ -844,7 +834,10 @@ void DoPadHitDataJson(void)
   Content += GET_DEBUG_BUFFER(1);
   Content += "],\n \"positionPoints\": [";
   Content += GET_DEBUG_BUFFER(2);
+  Content += "],\n \"Line4\": [";
+  Content += GET_DEBUG_BUFFER(3);
   Content += "  ]\n}";
+  DEBUG_FINISHED_PLOTTING();
   
   server.send(200, "application/json", Content);
 }
@@ -860,16 +853,22 @@ void DoVisualisationPage(void)
 }
 
 
-#define STATUS_TABLE_ROWS 2
+#define STATUS_TABLE_ROWS 6
 WEBTABLE_ROW StatusTableRows[STATUS_TABLE_ROWS] = {
   {"ADC Loops/second",      false,      &LoopsPerSecond,      "%d",    sizeof(int32_t)},
-  {"Midi messages/second",  false,      &MidiPerSecond,       "%d",    sizeof(int32_t)}
+  {"Midi messages/second",  false,      &MidiPerSecond,       "%d",    sizeof(int32_t)},
+  {"Idles/second",          false,      &IdlesPerSecond,       "%d",    sizeof(int32_t)},
+  {"NumHits",               false,      &LastHit.NumHits,     "%d",    sizeof(int32_t)},
+  {"MaxPeak",               false,      &MaxPeak,             "%d",    sizeof(int32_t)},
+  {"MaxPeakF",              false,      &MaxPeakF,            "%f",    sizeof(float)}
 };
 
 WEBTABLE StatusTable = { "Status Table", "status", STATUS_TABLE_ROWS, 1000, 4, StatusTableRows};
 void DoStatusJson(void)
 {
   WebTableWriteJson(&StatusTable, &server);
+  MaxPeak = 0;
+  MaxPeakF = 0.0f;
 }
 
 uint32_t PadType = 0;
@@ -877,15 +876,19 @@ int32_t VelocityThreshold = 0;
 int32_t VelocitySensitivity = 0;
 int32_t PosThreshold = 0;
 int32_t PosSensitivity = 0;
+int32_t SpikeCancelLevel = 0;
+int32_t MaskTime = 0;
 
-#define PAD_SETTINGS_TABLE_ROWS 6
+#define PAD_SETTINGS_TABLE_ROWS 8
 WEBTABLE_ROW PadSettingsTableRows[PAD_SETTINGS_TABLE_ROWS] = {
   {"Selected Pad",          true,      &selected_pad,          "%d",    sizeof(uint32_t)},
   {"Pad Type",              true,      &PadType,               "%d",    sizeof(uint32_t)},
   {"Velocitiy Sensitivity", true,      &VelocitySensitivity,   "%d",    sizeof(int32_t)},
   {"Velocity Threshold",    true,      &VelocityThreshold,     "%d",    sizeof(int32_t)},
   {"Pos Sensitivity",       true,      &PosSensitivity,        "%d",    sizeof(int32_t)},
-  {"Pos Threshold",         true,      &PosThreshold,          "%d",    sizeof(int32_t)}
+  {"Pos Threshold",         true,      &PosThreshold,          "%d",    sizeof(int32_t)},
+  {"Mask Time",             true,      &MaskTime,              "%d",    sizeof(int32_t)},
+  {"Spike Cancel Level",    true,      &SpikeCancelLevel,      "%d",    sizeof(int32_t)}
 };
 
 
@@ -899,7 +902,9 @@ void DoPadSettingsJson(void)
   VelocitySensitivity = edrumulus.get_velocity_sensitivity(selected_pad);
   PosSensitivity = edrumulus.get_pos_sensitivity(selected_pad);
   PosThreshold = edrumulus.get_pos_threshold(selected_pad);
-
+  SpikeCancelLevel = edrumulus.get_spike_cancel_level();
+  MaskTime = edrumulus.get_mask_time(selected_pad);
+  
   WebTableWriteJson(&PadSettings, &server);
 }
 void DoRootPage(void)
@@ -925,11 +930,17 @@ void DoRootPage(void)
       edrumulus.set_velocity_sensitivity(selected_pad, VelocitySensitivity);
       edrumulus.write_setting(selected_pad, 2, VelocitySensitivity);
       
-      edrumulus.set_pos_threshold(selected_pad, PosSensitivity);
-      edrumulus.write_setting(selected_pad, 3, PosSensitivity);
+      edrumulus.set_pos_threshold(selected_pad, PosThreshold);
+      edrumulus.write_setting(selected_pad, 3, PosThreshold);
       
-      edrumulus.set_pos_sensitivity(selected_pad, PosThreshold);
-      edrumulus.write_setting(selected_pad, 4, PosThreshold);
+      edrumulus.set_pos_sensitivity(selected_pad, PosSensitivity);
+      edrumulus.write_setting(selected_pad, 4, PosSensitivity);
+
+      edrumulus.set_spike_cancel_level(SpikeCancelLevel);
+      edrumulus.write_setting(number_pads, 0, SpikeCancelLevel);
+      
+      edrumulus.set_mask_time(selected_pad, MaskTime);
+      edrumulus.write_setting(selected_pad, 14, MaskTime);
     }
   }
 }
